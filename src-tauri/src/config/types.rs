@@ -221,6 +221,27 @@ impl Default for WelcomeConfig {
     }
 }
 
+/// 进场欢迎语音播报配置
+///
+/// 只播报「进房」一种形态（关注 / 点赞频率更高、信息量更低，不播报）。
+/// 与欢迎信息**显示**开关相互独立：关显示也能只听语音；
+/// 与弹幕朗读总开关也相互独立（仿礼物朗读，播报项不受总开关静音）。
+/// 进房事件先经 `welcome.rs` 的去重限速（30 秒最多 1 条），再决定念不念，
+/// 所以热房间里不会刷屏耳朵。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WelcomeTtsConfig {
+    /// 是否语音播报进场欢迎
+    pub enabled: bool,
+}
+
+impl Default for WelcomeTtsConfig {
+    fn default() -> Self {
+        // 新增功能默认静默：升级后不会突然出声，由主播主动开启
+        Self { enabled: false }
+    }
+}
+
 /// 最近连接过的直播间（主界面输入框下方面包屑，点击直连）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecentRoom {
@@ -246,5 +267,6 @@ pub struct ConfigFile {
     pub gift: GiftConfig,
     pub gift_tts: GiftTtsConfig,
     pub welcome: WelcomeConfig,
+    pub welcome_tts: WelcomeTtsConfig,
     pub recent_rooms: Vec<RecentRoom>,
 }

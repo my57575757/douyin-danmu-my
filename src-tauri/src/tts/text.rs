@@ -5,7 +5,7 @@
 
 use crate::config::{DanmakuFilter, TtsConfig};
 use crate::douyin::emote::strip_bracket_emotes;
-use crate::douyin::event::{Backing, Danmaku};
+use crate::douyin::event::{Backing, Danmaku, Welcome, WelcomeKind};
 use crate::douyin::mention::split_mention;
 
 /// 同一字符连续重复的最大保留次数（「哈哈哈哈哈哈哈」只读三个）
@@ -107,6 +107,22 @@ pub(super) fn build_backing_text(b: &Backing) -> String {
     } else {
         format!("感谢{name}送的{num}个{gift}")
     }
+}
+
+/// 组装进场欢迎朗读文案：欢迎 + 昵称 + 进入直播间
+///
+/// 只服务进房一种形态（关注 / 点赞频率更高且信息量更低，不播报）；
+/// 昵称与弹幕 / 打赏同口径清洗，纯符号昵称回退「观众」。
+pub(super) fn build_welcome_text(w: &Welcome) -> String {
+    format!("欢迎{}进入直播间", spoken_name(&w.username))
+}
+
+/// 进场欢迎的播报判定：开关开启且事件是进房时给文案，否则 None
+pub(super) fn welcome_speech_text(w: &Welcome, enabled: bool) -> Option<String> {
+    if !enabled || w.kind != WelcomeKind::Enter {
+        return None;
+    }
+    Some(build_welcome_text(w))
 }
 
 /// 朗读用的用户名：昵称里的 `_` 同样会被念成「下划线」，先剔噪声；
@@ -496,5 +512,49 @@ mod tests {
             ..DanmakuFilter::default()
         };
         assert!(!matches_filter(&danmaku("加群 广告"), &blocked));
+    }
+
+    fn welcome(kind: crate::douyin::event::WelcomeKind, username: &str) -> crate::douyin::event::Welcome {
+        crate::douyin::event::Welcome {
+            id: "t1".into(),
+            kind,
+            uid: 1,
+            username: username.into(),
+            timestamp: 0,
+        }
+    }
+
+    #[test]
+    fn 进场欢迎文案念出昵称() {
+        use crate::douyin::event::WelcomeKind;
+        assert_eq!(
+            build_welcome_text(&welcome(WelcomeKind::Enter, "小明")),
+            "欢迎小明进入直播间"
+        );
+    }
+
+    #[test]
+    fn 进场欢迎的纯符号昵称回退观众() {
+        use crate::douyin::event::WelcomeKind;
+        // 与弹幕 / 打赏同口径：昵称清洗后没可读字就回退「观众」，不能念出「欢迎进入直播间」
+        assert_eq!(
+            build_welcome_text(&welcome(WelcomeKind::Enter, "_＿_")),
+            "欢迎观众进入直播间"
+        );
+    }
+
+    #[test]
+    fn 只有进房形态且开关开启才给播报文案() {
+        use crate::douyin::event::WelcomeKind;
+        let enter = welcome(WelcomeKind::Enter, "小明");
+        assert_eq!(
+            welcome_speech_text(&enter, true),
+            Some("欢迎小明进入直播间".to_string())
+        );
+        // 开关关 → 不播报（与显示开关互不影响，由调用方各自判定）
+        assert_eq!(welcome_speech_text(&enter, false), None);
+        // 关注 / 点赞即使开关开着也不播报：本功能只欢迎「进场」
+        assert_eq!(welcome_speech_text(&welcome(WelcomeKind::Follow, "小明"), true), None);
+        assert_eq!(welcome_speech_text(&welcome(WelcomeKind::Like, "小明"), true), None);
     }
 }

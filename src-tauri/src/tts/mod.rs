@@ -14,8 +14,8 @@ mod worker;
 
 pub use worker::spawn_worker;
 
-use crate::config::{GiftTtsConfig, TtsConfig};
-use crate::douyin::event::{Backing, Danmaku};
+use crate::config::{GiftTtsConfig, TtsConfig, WelcomeTtsConfig};
+use crate::douyin::event::{Backing, Danmaku, Welcome};
 use crate::douyin::mention::split_mention;
 use crate::state::OverlayState;
 use std::collections::VecDeque;
@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager};
-use text::{build_backing_text, build_text, clean_for_speech, is_emote, matches_filter};
+use text::{build_backing_text, build_text, clean_for_speech, is_emote, matches_filter, welcome_speech_text};
 use tokio::sync::Notify;
 
 /// 打断冷却：距上次打断不足这么久就不再作废在途音频
@@ -31,10 +31,12 @@ use tokio::sync::Notify;
 const INTERRUPT_COOLDOWN: Duration = Duration::from_millis(1800);
 
 /// 队列项：`force` 标记不受「弹幕朗读」总开关限制
-/// （试听与礼物朗读都有自己的开关，不该被弹幕那一侧的总开关静音）
+/// （试听 / 礼物朗读 / 进场欢迎都有自己的开关，不该被弹幕那一侧的总开关静音）
 struct QueueItem {
     text: String,
     force: bool,
+    /// 进场欢迎：受自己的开关约束（合成时再查一次，关掉后排队中的欢迎不再出声）
+    welcome: bool,
 }
 
 /// 朗读队列与配置（Tauri 管理状态）
@@ -42,6 +44,8 @@ pub struct TtsState {
     config: Mutex<TtsConfig>,
     /// 礼物朗读配置（独立于弹幕朗读开关）
     gift_config: Mutex<GiftTtsConfig>,
+    /// 进场欢迎语音播报配置（独立于弹幕朗读开关与欢迎显示开关）
+    welcome_config: Mutex<WelcomeTtsConfig>,
     /// 待合成队列（满时丢最旧）
     queue: Mutex<VecDeque<QueueItem>>,
     /// 礼物连击聚合（静默满窗口才朗读，见 `gift.rs`）
@@ -63,6 +67,7 @@ impl TtsState {
         Self {
             config: Mutex::new(config),
             gift_config: Mutex::new(GiftTtsConfig::default()),
+            welcome_config: Mutex::new(WelcomeTtsConfig::default()),
             queue: Mutex::new(VecDeque::new()),
             gift: Mutex::new(gift::GiftAggregator::default()),
             notify: Notify::new(),
@@ -87,6 +92,18 @@ impl TtsState {
             self.gift.lock().unwrap().clear();
         }
         *self.gift_config.lock().unwrap() = config;
+    }
+
+    pub fn welcome_config(&self) -> WelcomeTtsConfig {
+        self.welcome_config.lock().unwrap().clone()
+    }
+
+    /// 更新进场欢迎播报配置：关掉时丢弃排队中的欢迎项（弹幕 / 礼物 / 试听都保留）
+    pub fn set_welcome_config(&self, config: WelcomeTtsConfig) {
+        if !config.enabled {
+            self.queue.lock().unwrap().retain(|item| !item.welcome);
+        }
+        *self.welcome_config.lock().unwrap() = config;
     }
 
     /// 总开关状态（播放端每个轮询查一次，决定要不要立刻停）
@@ -116,7 +133,7 @@ impl TtsState {
     }
 
     /// 入队；队列满时丢弃最旧的待朗读项（高速直播间不堆积）
-    fn push(&self, text: String, max_queue: u32, force: bool) {
+    fn push(&self, text: String, max_queue: u32, force: bool, welcome: bool) {
         let mut queue = self.queue.lock().unwrap();
         while queue.len() >= max_queue.max(1) as usize {
             // 丢最旧的**弹幕**：队首可能就是插队的礼物，直接 pop_front 会把它顶掉
@@ -131,9 +148,15 @@ impl TtsState {
                 }
             }
         }
-        queue.push_back(QueueItem { text, force });
+        queue.push_back(QueueItem { text, force, welcome });
         drop(queue);
         self.notify.notify_one();
+    }
+
+    /// 进场欢迎入队（队尾，强制项）：不受弹幕总开关静音、不被堆积打断作废；
+    /// 满队时与弹幕同走「丢最旧非强制项」，但欢迎本身稀疏（上游 30 秒最多放 1 条）
+    fn push_welcome(&self, text: String, max_queue: u32) {
+        self.push(text, max_queue, true, true);
     }
 
     /// 插队入队（礼物朗读）：放到队首，排在所有待朗读弹幕之前。
@@ -143,7 +166,11 @@ impl TtsState {
         while queue.len() >= max_queue.max(1) as usize {
             queue.pop_front();
         }
-        queue.push_front(QueueItem { text, force: true });
+        queue.push_front(QueueItem {
+            text,
+            force: true,
+            welcome: false,
+        });
         drop(queue);
         self.notify.notify_one();
     }
@@ -210,7 +237,7 @@ pub fn on_danmaku(app: &AppHandle, d: &Danmaku) {
     if text.is_empty() {
         return;
     }
-    state.push(text, max_queue, false);
+    state.push(text, max_queue, false, false);
     state.interrupt_if_backlogged(interrupt);
 }
 
@@ -220,7 +247,7 @@ pub fn speak_test(app: &AppHandle, text: &str) {
     if text.is_empty() {
         return;
     }
-    app.state::<TtsState>().push(text, 1, true);
+    app.state::<TtsState>().push(text, 1, true, false);
 }
 
 /// 打赏到达钩子（非阻塞，在弹幕事件回调里调用）
@@ -235,6 +262,20 @@ pub fn on_backing(app: &AppHandle, b: &Backing) {
         .lock()
         .unwrap()
         .on_backing(b.clone(), Instant::now());
+}
+
+/// 欢迎事件到达钩子（非阻塞）：只播报进房，开关与形态判定见 `text::welcome_speech_text`。
+///
+/// 事件已经过 `welcome::on_welcome` 的去重限速（同人 60 秒去重、全局 30 秒最多 1 条），
+/// 这里不再限速；与欢迎信息**显示**开关互不影响。
+pub fn on_welcome(app: &AppHandle, w: &Welcome) {
+    let state = app.state::<TtsState>();
+    let enabled = state.welcome_config().enabled;
+    let Some(text) = welcome_speech_text(w, enabled) else {
+        return;
+    };
+    let max_queue = state.config().max_queue;
+    state.push_welcome(text, max_queue);
 }
 
 /// 把一条打赏插队送进朗读队列（开关开启且过了朗读门槛才念）
@@ -289,7 +330,7 @@ mod tests {
     fn queue_drops_oldest_when_full() {
         let state = TtsState::new(TtsConfig::default());
         for i in 0..5 {
-            state.push(format!("第{i}条"), 3, false);
+            state.push(format!("第{i}条"), 3, false, false);
         }
         let queue = state.queue.lock().unwrap();
         assert_eq!(queue.len(), 3);
@@ -299,7 +340,7 @@ mod tests {
     #[test]
     fn interrupt_only_when_playing_with_backlog_and_outside_cooldown() {
         let state = TtsState::new(TtsConfig::default());
-        state.push("新弹幕".into(), 5, false);
+        state.push("新弹幕".into(), 5, false, false);
 
         // 没在出声 → 不打断
         state.interrupt_if_backlogged(true);
@@ -328,8 +369,8 @@ mod tests {
     #[test]
     fn 插队的礼物排在待朗读弹幕之前() {
         let state = TtsState::new(TtsConfig::default());
-        state.push("弹幕一".into(), 5, false);
-        state.push("弹幕二".into(), 5, false);
+        state.push("弹幕一".into(), 5, false, false);
+        state.push("弹幕二".into(), 5, false, false);
         state.push_front("感谢老板A送的5个辣条".into(), 5);
         let queue = state.queue.lock().unwrap();
         assert_eq!(queue.front().unwrap().text, "感谢老板A送的5个辣条");
@@ -340,7 +381,7 @@ mod tests {
     fn 插队的礼物不会被队列上限挤掉() {
         let state = TtsState::new(TtsConfig::default());
         for i in 0..5 {
-            state.push(format!("弹幕{i}"), 2, false);
+            state.push(format!("弹幕{i}"), 2, false, false);
         }
         // 队列已满（上限 2）：插队时丢的是最旧的弹幕，礼物自己一定在队首
         state.push_front("感谢老板A送的5个辣条".into(), 2);
@@ -355,7 +396,7 @@ mod tests {
         let state = TtsState::new(TtsConfig::default());
         state.push_front("感谢老板A送的5个辣条".into(), 2);
         for i in 0..5 {
-            state.push(format!("弹幕{i}"), 2, false);
+            state.push(format!("弹幕{i}"), 2, false, false);
         }
         let queue = state.queue.lock().unwrap();
         assert_eq!(queue.len(), 2);
@@ -366,7 +407,7 @@ mod tests {
     #[test]
     fn 关闭总开关时保留试听与礼物朗读() {
         let state = TtsState::new(TtsConfig::default());
-        state.push("弹幕一".into(), 5, false);
+        state.push("弹幕一".into(), 5, false, false);
         state.push_front("感谢老板A送的5个辣条".into(), 5);
         state.set_config(TtsConfig {
             enabled: false,
@@ -403,5 +444,38 @@ mod tests {
             &GiftTtsConfig::default(),
         );
         assert!(due.is_empty());
+    }
+
+    #[test]
+    fn 欢迎播报默认关闭() {
+        let state = TtsState::new(TtsConfig::default());
+        assert!(!state.welcome_config().enabled);
+    }
+
+    #[test]
+    fn 欢迎项以强制项入队_关总开关不影响它() {
+        let state = TtsState::new(TtsConfig::default());
+        state.set_welcome_config(crate::config::WelcomeTtsConfig { enabled: true });
+        state.push_welcome("欢迎小明进入直播间".into(), 5);
+        let queue = state.queue.lock().unwrap();
+        let item = queue.front().unwrap();
+        assert_eq!(item.text, "欢迎小明进入直播间");
+        assert!(item.force, "欢迎播报不受弹幕朗读总开关与打断作废影响");
+        assert!(item.welcome);
+    }
+
+    #[test]
+    fn 关闭欢迎播报时只丢欢迎项() {
+        let state = TtsState::new(TtsConfig::default());
+        state.set_welcome_config(crate::config::WelcomeTtsConfig { enabled: true });
+        state.push("弹幕一".into(), 5, false, false);
+        state.push_front("感谢老板A送的5个辣条".into(), 5);
+        state.push_welcome("欢迎小明进入直播间".into(), 5);
+        assert_eq!(state.queue.lock().unwrap().len(), 3);
+
+        state.set_welcome_config(crate::config::WelcomeTtsConfig { enabled: false });
+        let queue = state.queue.lock().unwrap();
+        assert_eq!(queue.len(), 2, "只丢欢迎项，弹幕与礼物朗读都保留");
+        assert!(queue.iter().all(|item| item.text != "欢迎小明进入直播间"));
     }
 }

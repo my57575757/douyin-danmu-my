@@ -77,6 +77,11 @@ pub fn spawn_worker(app: AppHandle) {
             if !config.enabled && !item.force {
                 continue;
             }
+            // 进场欢迎有自己的开关：关欢迎后排队中 / 在途的欢迎整条不播
+            // （force 只让它免疫弹幕总开关与打断作废，不免疫它自己的开关）
+            if item.welcome && !app.state::<TtsState>().welcome_config().enabled {
+                continue;
+            }
             let epoch = app.state::<TtsState>().epoch.load(Ordering::Relaxed);
             // 总超时兜住建连阶段：edge::synthesize 内部只覆盖收流，网络黑洞时建连会拖到
             // 系统 TCP 超时（Windows ~21s），单合成任务被独占，期间队列持续丢弹幕

@@ -198,6 +198,23 @@ pub(crate) fn welcome_set_config(
     config::save_welcome_config(&app, &welcome)
 }
 
+/// 读取进场欢迎语音播报配置
+#[tauri::command]
+pub(crate) fn welcome_tts_get_config(state: State<'_, tts::TtsState>) -> config::WelcomeTtsConfig {
+    state.welcome_config()
+}
+
+/// 更新进场欢迎语音播报配置：内存态实时生效（关掉即丢弃排队中的欢迎）并持久化
+#[tauri::command]
+pub(crate) fn welcome_tts_set_config(
+    app: AppHandle,
+    state: State<'_, tts::TtsState>,
+    welcome_tts: config::WelcomeTtsConfig,
+) -> Result<(), String> {
+    state.set_welcome_config(welcome_tts.clone());
+    config::save_welcome_tts_config(&app, &welcome_tts)
+}
+
 /// 查询 Overlay 当前尺寸（逻辑像素，与 overlay_set_size 同一口径）
 #[tauri::command]
 pub(crate) fn overlay_get_size(app: AppHandle, state: State<'_, OverlayState>) -> Result<serde_json::Value, String> {

@@ -124,6 +124,17 @@ export const DEFAULT_WELCOME_CONFIG: WelcomeConfig = {
   enabled: false,
 }
 
+/** 进场欢迎语音播报配置（Rust ↔ Vue）；只播报进房，关注 / 点赞不播报 */
+export interface WelcomeTtsConfig {
+  /** 是否语音播报进场欢迎（默认关，独立于弹幕朗读总开关与欢迎显示开关） */
+  enabled: boolean
+}
+
+/** 进场欢迎播报默认配置（与 config/types.rs 的 WelcomeTtsConfig::default 保持一致） */
+export const DEFAULT_WELCOME_TTS_CONFIG: WelcomeTtsConfig = {
+  enabled: false,
+}
+
 /** Overlay 弹幕样式（Rust ↔ Vue） */
 export interface OverlayStyle {
   font_size: number

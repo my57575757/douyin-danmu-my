@@ -9,9 +9,11 @@ import {
   DEFAULT_GIFT_CONFIG,
   DEFAULT_GIFT_TTS_CONFIG,
   DEFAULT_WELCOME_CONFIG,
+  DEFAULT_WELCOME_TTS_CONFIG,
   type GiftConfig,
   type GiftTtsConfig,
   type WelcomeConfig,
+  type WelcomeTtsConfig,
 } from '../types/ipc'
 
 // 页内标签：gift / giftTts / welcome
@@ -23,6 +25,8 @@ const gift = ref<GiftConfig>({ ...DEFAULT_GIFT_CONFIG })
 const giftTts = ref<GiftTtsConfig>({ ...DEFAULT_GIFT_TTS_CONFIG })
 // 欢迎信息配置（默认关；限流在 Rust 侧，这里只负责开关读写）
 const welcome = ref<WelcomeConfig>({ ...DEFAULT_WELCOME_CONFIG })
+// 进场欢迎语音播报配置（只念进房；与显示开关、弹幕朗读总开关各自独立）
+const welcomeTts = ref<WelcomeTtsConfig>({ ...DEFAULT_WELCOME_TTS_CONFIG })
 
 const { savedTip, opError, showSaved, showError } = useSaveTip()
 
@@ -59,11 +63,21 @@ async function applyWelcome() {
   }
 }
 
+async function applyWelcomeTts() {
+  try {
+    await invoke('welcome_tts_set_config', { welcomeTts: { ...welcomeTts.value } })
+    showSaved()
+  } catch (e) {
+    showError(e)
+  }
+}
+
 onMounted(async () => {
   try {
     gift.value = await invoke<GiftConfig>('gift_get_config')
     giftTts.value = await invoke<GiftTtsConfig>('gift_tts_get_config')
     welcome.value = await invoke<WelcomeConfig>('welcome_get_config')
+    welcomeTts.value = await invoke<WelcomeTtsConfig>('welcome_tts_get_config')
   } catch (e) {
     console.error('读取礼物配置失败', e)
   }
@@ -164,7 +178,21 @@ onMounted(async () => {
           <b>默认关闭</b>
           ：适合观众不多、想看着有人进来的直播间。 开启后大约每 30 秒显示一条，同一个人 1 分钟内只出现一次。
         </p>
-        <p class="tip">抖音没有舰队档位，所以没有「只朗读舰长进场」这类选项。</p>
+      </div>
+
+      <div class="setting-card">
+        <SettingRow label="语音播报进场欢迎">
+          <input v-model="welcomeTts.enabled" type="checkbox" class="switch" @change="applyWelcomeTts()" />
+        </SettingRow>
+
+        <p class="tip">
+          有观众进房时念一句「欢迎某某进入直播间」，
+          <b>只念进房</b>
+          ，关注和点赞不念。 与上方的显示开关、与「朗读」页的弹幕朗读总开关都互不影响，关掉弹幕朗读也照念； 音色 / 语速
+          / 音量沿用「朗读」页的设置。 同样受每 30 秒最多一条的限速，热房间不会刷屏，
+          <b>默认关闭</b>
+          。
+        </p>
       </div>
     </section>
   </div>

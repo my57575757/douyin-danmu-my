@@ -88,6 +88,8 @@ pub(crate) fn on_welcome(app: &AppHandle, w: Welcome) {
     if !pass {
         return;
     }
+    // 语音播报与显示各自独立：关着显示也能只听进场欢迎（开关在 tts 侧判定）
+    crate::tts::on_welcome(app, &w);
     let render = app.state::<OverlayState>().welcome.lock().unwrap().enabled;
     if render {
         let _ = app.emit("welcome", &w);
