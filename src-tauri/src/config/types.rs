@@ -213,11 +213,20 @@ impl Default for GiftTtsConfig {
 pub struct WelcomeConfig {
     /// 是否在弹幕窗显示欢迎信息（关掉时 Rust 侧直接不广播）
     pub enabled: bool,
+    /// 同一人同类事件 60 秒内只提示一次（关掉则反复进出都提示）
+    pub dedupe_enabled: bool,
+    /// 全局每 30 秒最多放行 1 条（所有形态共用一个池；关掉则不限条数）
+    pub rate_limit_enabled: bool,
 }
 
 impl Default for WelcomeConfig {
     fn default() -> Self {
-        Self { enabled: false }
+        // 两道限流默认都开：热房间进场量比弹幕还大，关了会刷屏、刷耳朵
+        Self {
+            enabled: false,
+            dedupe_enabled: true,
+            rate_limit_enabled: true,
+        }
     }
 }
 

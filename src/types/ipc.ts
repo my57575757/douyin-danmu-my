@@ -101,8 +101,8 @@ export const DEFAULT_GIFT_TTS_CONFIG: GiftTtsConfig = {
 /**
  * 欢迎消息（Rust → Vue，事件名 welcome）
  *
- * 已在 Rust 侧做完去重（同人同类 60 秒）与限速（每 30 秒最多 1 条），
- * 前端收到即可直接渲染。
+ * 已在 Rust 侧按配置做完去重（同人同类 60 秒）与限速（每 30 秒最多 1 条），
+ * 两道闸各有开关（见 WelcomeConfig），前端收到即可直接渲染。
  */
 export interface WelcomeEvent {
   id: string
@@ -117,11 +117,17 @@ export interface WelcomeEvent {
 export interface WelcomeConfig {
   /** 是否在弹幕窗显示欢迎信息（默认关） */
   enabled: boolean
+  /** 同一人同类事件 60 秒内只提示一次（默认开；关掉则反复进出都提示） */
+  dedupe_enabled: boolean
+  /** 全局每 30 秒最多放行 1 条（默认开；关掉则不限条数） */
+  rate_limit_enabled: boolean
 }
 
 /** 欢迎信息默认配置（与 config/types.rs 的 WelcomeConfig::default 保持一致） */
 export const DEFAULT_WELCOME_CONFIG: WelcomeConfig = {
   enabled: false,
+  dedupe_enabled: true,
+  rate_limit_enabled: true,
 }
 
 /** 进场欢迎语音播报配置（Rust ↔ Vue）；只播报进房，关注 / 点赞不播报 */

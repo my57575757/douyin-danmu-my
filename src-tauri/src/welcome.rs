@@ -8,10 +8,13 @@
 //! 2. 限速：每 `RATE_WINDOW` 最多 `MAX_PER_WINDOW` 条，**所有形态共用一个池**
 //!    （分形态各一份的话合起来就是二十几条/分钟，比中位房间的弹幕还密，那就是刷屏）
 //!
+//! 两道闸各有开关（`WelcomeConfig::dedupe_enabled` / `rate_limit_enabled`），默认都开；
+//! 放行判定**与「显示 / 语音播报」开关无关地先跑**——后两者只决定放行后交给谁。
+//!
 //! 丢掉的欢迎消息不补发——它是「热闹感」，不是必须送达的消息。
 //!
 //! 抖音没有舰队（舰长进场），所以 B 站侧那套「舰长进场单独一个小池」的额度
-//! 在这里不存在；朗读侧也不再消费欢迎事件（没有值得单独出声的档位）。
+//! 在这里不存在；朗读侧只消费进房（关注 / 点赞不播报，见 `tts::on_welcome`）。
 
 use crate::douyin::event::{Welcome, WelcomeKind};
 use crate::state::OverlayState;
@@ -45,52 +48,67 @@ struct Inner {
 
 impl Inner {
     /// 判定这条欢迎消息是否放行
-    fn admit(&mut self, w: &Welcome, now: Instant) -> bool {
+    ///
+    /// `dedupe_enabled` / `rate_limit_enabled` 分别控制两道闸（配置见 `WelcomeConfig`）：
+    /// 关掉的那一关直接跳过，且不写对应的去重表 / 额度槽。
+    fn admit(&mut self, w: &Welcome, now: Instant, dedupe_enabled: bool, rate_limit_enabled: bool) -> bool {
         // 1. 去重：同一个人同类事件在窗口内只出一条
         let key = (w.kind, w.uid);
-        if let Some(last) = self.seen.get(&key) {
-            if now.duration_since(*last) < Duration::from_secs(DEDUPE_SECS) {
-                return false;
+        if dedupe_enabled {
+            if let Some(last) = self.seen.get(&key) {
+                if now.duration_since(*last) < Duration::from_secs(DEDUPE_SECS) {
+                    return false;
+                }
             }
         }
         // 2. 限速：所有形态共用一个池
-        while self
-            .slots
-            .front()
-            .is_some_and(|t| now.duration_since(*t) >= RATE_WINDOW)
-        {
-            self.slots.pop_front();
+        if rate_limit_enabled {
+            while self
+                .slots
+                .front()
+                .is_some_and(|t| now.duration_since(*t) >= RATE_WINDOW)
+            {
+                self.slots.pop_front();
+            }
+            if self.slots.len() >= MAX_PER_WINDOW {
+                return false;
+            }
+            self.slots.push_back(now);
         }
-        if self.slots.len() >= MAX_PER_WINDOW {
-            return false;
+        if dedupe_enabled {
+            // 去重记录只值几十秒，满了整体清空即可，不值得为它做 LRU
+            if self.seen.len() >= DEDUPE_CAP {
+                self.seen.clear();
+            }
+            self.seen.insert(key, now);
         }
-        self.slots.push_back(now);
-        // 去重记录只值几十秒，满了整体清空即可，不值得为它做 LRU
-        if self.seen.len() >= DEDUPE_CAP {
-            self.seen.clear();
-        }
-        self.seen.insert(key, now);
         true
     }
 }
 
-/// 处理一条欢迎消息 → 去重限速 → 广播给弹幕窗
+/// 处理一条欢迎消息 → 去重限速 → 分发给语音播报与弹幕窗
 ///
-/// 去重与限速**与开关无关地先跑**：开关只决定「播不播」。若让开关去挡限速，
-/// 关掉显示时同一个观众反复进出就能绕过去重表，开回来后一次刷出一大片。
+/// 去重 / 限速各自有开关，但判定仍在「显示 / 播报」分发之前跑：
+/// 若让显示开关去挡限流，关掉显示时同一个观众反复进出就能绕过去重表，开回来后一次刷出一大片。
+/// 显示行与语音播报是放行后的两个独立消费者（限流开关对两路同时生效）。
 pub(crate) fn on_welcome(app: &AppHandle, w: Welcome) {
+    // 先短锁读配置再判定，避免与 WelcomeState 形成持锁嵌套
+    let ov = app.state::<OverlayState>();
+    let (render, dedupe_enabled, rate_limit_enabled) = {
+        let cfg = ov.welcome.lock().unwrap();
+        (cfg.enabled, cfg.dedupe_enabled, cfg.rate_limit_enabled)
+    };
     // 锁内只判定不广播：emit 是跨 webview 的分发，压在状态锁里迟早把锁序搅乱
     let pass = {
         let st = app.state::<WelcomeState>();
         let mut inner = st.inner.lock().unwrap();
-        inner.admit(&w, Instant::now())
+        inner.admit(&w, Instant::now(), dedupe_enabled, rate_limit_enabled)
     };
     if !pass {
         return;
     }
-    // 语音播报与显示各自独立：关着显示也能只听进场欢迎（开关在 tts 侧判定）
+    // 语音播报与显示各自独立：关着显示也能只听进场欢迎（播报开关在 tts 侧判定）
     crate::tts::on_welcome(app, &w);
-    let render = app.state::<OverlayState>().welcome.lock().unwrap().enabled;
     if render {
         let _ = app.emit("welcome", &w);
     }
@@ -114,24 +132,44 @@ mod tests {
     fn 同一人去重窗口内只过一条() {
         let mut inner = Inner::default();
         let now = Instant::now();
-        assert!(inner.admit(&welcome(WelcomeKind::Enter, 1), now));
+        assert!(inner.admit(&welcome(WelcomeKind::Enter, 1), now, true, true));
         // 31 秒后：已出限速窗口，但仍在 60 秒去重窗口内 → 挡在去重这一关
-        assert!(!inner.admit(&welcome(WelcomeKind::Enter, 1), now + Duration::from_secs(31)));
+        assert!(!inner.admit(
+            &welcome(WelcomeKind::Enter, 1),
+            now + Duration::from_secs(31),
+            true,
+            true
+        ));
         // 61 秒后：两个窗口都过期
-        assert!(inner.admit(&welcome(WelcomeKind::Enter, 1), now + Duration::from_secs(61)));
+        assert!(inner.admit(
+            &welcome(WelcomeKind::Enter, 1),
+            now + Duration::from_secs(61),
+            true,
+            true
+        ));
     }
 
     #[test]
     fn 全局额度用完后丢弃() {
         let mut inner = Inner::default();
         let now = Instant::now();
-        assert!(inner.admit(&welcome(WelcomeKind::Enter, 1), now));
+        assert!(inner.admit(&welcome(WelcomeKind::Enter, 1), now, true, true));
         assert!(
-            !inner.admit(&welcome(WelcomeKind::Enter, 2), now + Duration::from_secs(1)),
+            !inner.admit(
+                &welcome(WelcomeKind::Enter, 2),
+                now + Duration::from_secs(1),
+                true,
+                true
+            ),
             "额度内第二个人也要丢"
         );
         assert!(
-            inner.admit(&welcome(WelcomeKind::Enter, 3), now + Duration::from_secs(31)),
+            inner.admit(
+                &welcome(WelcomeKind::Enter, 3),
+                now + Duration::from_secs(31),
+                true,
+                true
+            ),
             "出窗口后放行"
         );
     }
@@ -140,12 +178,12 @@ mod tests {
     fn 不同形态共用同一份全局额度() {
         let mut inner = Inner::default();
         let now = Instant::now();
-        assert!(inner.admit(&welcome(WelcomeKind::Enter, 1), now));
+        assert!(inner.admit(&welcome(WelcomeKind::Enter, 1), now, true, true));
         assert!(
-            !inner.admit(&welcome(WelcomeKind::Follow, 2), now),
+            !inner.admit(&welcome(WelcomeKind::Follow, 2), now, true, true),
             "换形态不额外给额度——这正是分形态限速会刷屏的原因"
         );
-        assert!(!inner.admit(&welcome(WelcomeKind::Like, 3), now));
+        assert!(!inner.admit(&welcome(WelcomeKind::Like, 3), now, true, true));
     }
 
     #[test]
@@ -156,11 +194,67 @@ mod tests {
         let mut admitted = 0usize;
         for i in 0..1200u64 {
             let w = welcome(WelcomeKind::Enter, i as i64);
-            if inner.admit(&w, now + Duration::from_millis(i * 500)) {
+            if inner.admit(&w, now + Duration::from_millis(i * 500), true, true) {
                 admitted += 1;
             }
         }
         assert_eq!(admitted, 20, "10 分钟 ÷ 30 秒窗口 = 20 条，与灌入速率无关");
+    }
+
+    #[test]
+    fn 两道闸都关时同人连发全部放行() {
+        let mut inner = Inner::default();
+        let now = Instant::now();
+        for i in 0..3u64 {
+            assert!(
+                inner.admit(
+                    &welcome(WelcomeKind::Enter, 1),
+                    now + Duration::from_secs(i),
+                    false,
+                    false
+                ),
+                "关去重 + 关限速：每个人每次进来都提示"
+            );
+        }
+        assert!(inner.seen.is_empty(), "关去重时不写去重表");
+        assert!(inner.slots.is_empty(), "关限速时不占额度");
+    }
+
+    #[test]
+    fn 只关去重时同人仍受全局限速() {
+        let mut inner = Inner::default();
+        let now = Instant::now();
+        assert!(inner.admit(&welcome(WelcomeKind::Enter, 1), now, false, true));
+        // 1 秒后同人再来：去重已关，但 30 秒全局额度还在 → 丢
+        assert!(!inner.admit(
+            &welcome(WelcomeKind::Enter, 1),
+            now + Duration::from_secs(1),
+            false,
+            true
+        ));
+        // 31 秒后额度窗口过去 → 同人也放行
+        assert!(inner.admit(
+            &welcome(WelcomeKind::Enter, 1),
+            now + Duration::from_secs(31),
+            false,
+            true
+        ));
+    }
+
+    #[test]
+    fn 只关限速时不同人秒过但同人仍被去重() {
+        let mut inner = Inner::default();
+        let now = Instant::now();
+        assert!(inner.admit(&welcome(WelcomeKind::Enter, 1), now, true, false));
+        // 限速关了：换个新人同一秒也放行
+        assert!(inner.admit(&welcome(WelcomeKind::Enter, 2), now, true, false));
+        // 但同一人 60 秒内反复进出仍只提示一次
+        assert!(!inner.admit(
+            &welcome(WelcomeKind::Enter, 1),
+            now + Duration::from_secs(10),
+            true,
+            false
+        ));
     }
 
     #[test]
@@ -172,6 +266,8 @@ mod tests {
             inner.admit(
                 &welcome(WelcomeKind::Enter, uid),
                 now + Duration::from_secs(uid as u64 * 31),
+                true,
+                true,
             );
         }
         assert!(inner.seen.len() <= DEDUPE_CAP, "清空后表长应回落到容量以内");
